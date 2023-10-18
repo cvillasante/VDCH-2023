@@ -5,7 +5,7 @@
 
 ### Associated works and data
 BioRxiv pre-print: <br>
-Processed data stored in Dryad repository: https://doi.org/10.5061/dryad.stqjq2c8s
+Data stored in Dryad repository: https://doi.org/10.5061/dryad.stqjq2c8s
 
 ### Description of files
 FitModeltoData_20231017.py: Fits our model to the force-extension PCDH15 data.<br>
