@@ -111,7 +111,7 @@ for subdir, dirs, files in os.walk(rootdir):
                         # Now calculate d_force, d_extension, and stiffness
                         d_force= df_mean_pull['force_savgol'].iloc[-1]-df_mean_pull['force_savgol'].iloc[0]
                         d_extension= df_mean_pull['extension_savgol'].iloc[-1]-df_mean_pull['extension_savgol'].iloc[0]
-                        stiffness=d_force/d_extension
+                        stiffness=d_force/d_extension # mN/m
                         stiffness_list.append(stiffness)
 
         # Assign stiffnesses to correct list depending on construct/condition
