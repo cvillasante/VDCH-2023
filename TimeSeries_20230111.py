@@ -1,0 +1,1089 @@
+# 11 January 2023
+# Switch variables --> force as indepedent variable, extension as dependent
+
+from holoviews.element.geom import Segments
+import pandas as pd
+import numpy as np
+import xarray as xr
+import nptdms
+import plotly.graph_objs as go
+import holoviews as hv
+import datashader as ds
+import warnings
+import tqdm
+import holoviews.operation.datashader as hd
+hd.shade.cmap=["lightblue", "darkblue"]
+ 
+from scipy.signal import argrelmax as argrelmax
+from scipy.signal import find_peaks as find_peaks
+from scipy.ndimage.filters import gaussian_filter1d as gaussian_filter1d
+from scipy.optimize import curve_fit, leastsq
+from scipy.stats import ttest_ind
+from scipy.signal import savgol_filter
+from collections import OrderedDict 
+from multiprocessing import Pool
+from functools import partial 
+from collections import OrderedDict 
+from multiprocessing import Pool
+from functools import partial 
+
+
+class TimeSeriesLoader(object):
+    '''Provides data structures and methods to analyze single-molecule data.'''
+
+    def __init__ (self):
+        #define some default values
+        data = np.empty((3,2))
+        data.fill(np.nan)
+        self.properties_mephisto = pd.DataFrame(data, columns=['k','tau'])
+        
+        data = np.empty((6,3))
+        data.fill(np.nan)        
+        self.nonlin_correction = pd.DataFrame(data, columns=['coeff_x','coeff_y', 'coeff_z'])
+        
+        self.pedestalcorr = np.array([np.nan, np.nan, np.nan])
+        
+        data = np.empty((22,3))
+        data.fill(np.nan)
+        self.focus_shift = pd.DataFrame(data, columns=['xmean', 'ymean', 'zmean'])
+        self.focus_shift.index.name = 'voltage'
+        self.focus_shift = self.focus_shift.to_xarray()
+
+        data = np.empty((3,2))
+        data.fill(np.nan)
+        self.Flyvbjerg_Corr = pd.DataFrame(data, columns=['Flyvbjerg Coef','Flyvbjerg Corr'])
+
+        self.coverslip_corr = np.nan
+
+        self.offsets = np.array([np.nan, np.nan, np.nan])
+         	
+
+    def load_Mephisto_properties(self, path_to_springconst):
+        '''loads the spring constants and autocorrelation times of the Mephisto trap (1064 nm laser) into a pandas dataframe
+        
+        Args:
+            path_to_springconst (string): path to the file containing the Mephisto spring constants
+        '''
+        self.properties_mephisto = pd.read_csv(path_to_springconst, sep='\t',header=0, names=['k', 'tau'],skiprows=0)
+    
+    def load_nonlin_correction(self, path_to_nonlincorrection):
+        '''loads the nonlinear correction coefficients into a pandas dataframe.
+        
+        Args:
+            path_to_nonlincorrection (string): path to the file containing the coefficients.
+        '''
+        self.nonlin_correction = pd.read_csv(path_to_nonlincorrection, sep='\t',header=0, names=['x', 'y', 'z'],skiprows=0)
+    
+    def load_pedestal_correction(self, path_to_initialStagePos, path_to_OffsetsX, path_to_OffsetsY, path_to_OffsetsZ, path_to_OffsetStagePos, path_to_ZeroOffsets):
+        '''loads all files necessary to correct for light scattered by the pedestal beads, and computes a matrix of correction voltages.
+        
+        Args:
+            path_to_initialStagePos (string): path to stagePosAtStartofFeedback.csv, the file containing the stage position at the start of the active feedback loop that stabilizes the sample.
+            path_to_OffsetsX (string): path to OffsetsX.csv, containing the offset voltages on the X channel of the detector introduced by the pedestal bead. This is a 2D matrix; each point in the matrix represents one scanned position in the sample.
+            path_to_OffsetsY (string): path to OffsetsY.csv, containing the offset voltages on the Y channel of the detector introduced by the pedestal bead. This is a 2D matrix; each point in the matrix represents one scanned position in the sample.
+            path_to_OffsetsZ (string): path to OffsetsZ.csv, containing the offset voltages on the Z channel of the detector introduced by the pedestal bead. This is a 2D matrix; each point in the matrix represents one scanned position in the sample.
+            path_to_OffsetStagePos (string): path to OffsetStagePos.csv, containing the stage positions during the scan of the offset voltages.
+            path_to_ZeroOffsets (string): path to ZeroOffsetsPedestal.csv, containing the x, y and z voltages on the detector for a position far from a pedestal bead.
+        '''
+        initial_stagepos = np.genfromtxt(path_to_initialStagePos) * 1e-6
+        
+        offset_stagepos = np.genfromtxt(path_to_OffsetStagePos) * 1e-6
+        StartX = offset_stagepos[0][0]
+        StartY = offset_stagepos[0][1]
+        dx = (offset_stagepos[1][0]-offset_stagepos[0][0])
+        dy = (offset_stagepos[1][1]-offset_stagepos[0][1])
+
+        zero_offsets = np.genfromtxt(path_to_ZeroOffsets) 
+        
+        dataX = np.genfromtxt(path_to_OffsetsX) - zero_offsets[0] #zero the offset data
+        dataY = np.genfromtxt(path_to_OffsetsY) - zero_offsets[1]
+        dataZ = np.genfromtxt(path_to_OffsetsZ) - zero_offsets[2]
+
+        #zero_offsets = np.genfromtxt(path_to_ZeroOffsets) 
+
+        OffsetsX = xr.DataArray(dataX,
+                       dims=('y', 'x'),
+                       coords={'x': StartX + np.arange(dataX.shape[1]) * dx, 'y': StartY + np.arange(dataX.shape[0]) * dy},
+                       name='Offsets X')
+        OffsetsY = xr.DataArray(dataY,
+                       dims=('y', 'x'),
+                       coords={'x': StartX + np.arange(dataY.shape[1]) * dx, 'y': StartY + np.arange(dataY.shape[0]) * dy},
+                       name='Offsets Y')
+        OffsetsZ = xr.DataArray(dataZ,
+                       dims=('y', 'x'),
+                       coords={'x': StartX + np.arange(dataZ.shape[1]) * dx, 'y': StartY + np.arange(dataZ.shape[0]) * dy},
+                       name='Offsets Z')
+        
+        self.pedestalcorr = np.array([OffsetsX.interp(x = initial_stagepos[0], y = initial_stagepos[1]), \
+            OffsetsY.interp(x = initial_stagepos[0], y = initial_stagepos[1]), \
+                OffsetsZ.interp(x = initial_stagepos[0], y = initial_stagepos[1])])
+
+        
+    def load_focusshift(self, path_to_focusshift):
+        '''loads the focus shift of the 852nm laser vs its intensity setpoint into an xarray DataSet.
+        
+        Args:
+            path_to_focusshift (string): path to 852_focus_shift.csv which contains the focus shift data.
+        '''
+
+        #this needs to be a DataArray so that we can easily interpolate.
+        #Drop the first datapoint (power less than 0.5). When the laser is off we cannot know where the focus has shifted to, so that value is meaningless.
+        self.focus_shift = pd.read_csv(path_to_focusshift, sep='\t', index_col=0)[0.5:].to_xarray() * 1e-9
+        
+    def load_FlyvbjergCorr(self, path_to_flyvbjergCorr):
+        '''loads the Flyvbjerg correction coefficients.
+
+        Args:
+            path_to_flyvbjergCorr (string): path to FlyvbjergCorrection.csv containing the correction coefficients.
+        '''
+
+        self.Flyvbjerg_Corr = pd.read_csv(path_to_flyvbjergCorr, sep='\t')
+
+    def load_correctionCloseToCoverslip(self, path_to_852Pos, path_to_Extended852Pos):
+        '''Close to the coverslip the position sensor has a ~10% systematic error. Load two position signals that are nominally 100 nm apart and compute a correction factor.
+        
+        Args: 
+            path_to_852Pos (string): path to 852ZeroPosBeforeTrials.csv
+            path_to_Extended852Pos (string): path to 852ExtendedPosBeforeTrials.csv
+        '''
+
+        zero = np.genfromtxt(path_to_852Pos)
+        extended = np.genfromtxt(path_to_Extended852Pos)
+        self.coverslip_corr = (extended[1] - zero[1])/100.0
+
+    def load_offsets(self, path_to_offsets):
+        '''load offsets to set the middle of the optical trap as the origin (0,0,0). Offsets are to be added post-calibration to the position traces.
+
+        Args:
+            path_to_offsets (string): path to offsets.csv.
+        '''
+        self.offsets = np.genfromtxt(path_to_offsets, skip_header=1) *1e-9
+
+    def loadAndCalibrateSignals(self, path_to_signals):
+        '''load the signals, calibrate, and correct them.
+
+        Args: 
+            path_to_signals (string): path to the signals.tdms file.
+        '''
+
+        tdms_file = nptdms.TdmsFile("signals.tdms")
+        self.xchannel = tdms_file['position_data']['xwaveFSD']
+        self.ychannel = tdms_file['position_data']['ywaveFSD']
+        self.zchannel = tdms_file['position_data']['zwaveFSD']
+        power = tdms_file['position_data']['powerFSD']
+
+        self.powerArray = xr.DataArray(np.array(power.data),
+                                        dims = 'time',
+                                        coords = {'time': power.time_track()},
+                                        name='power')
+        
+        self.data_calibrated = xr.Dataset({'x': self._calibrateAndCorrect_Channel(self.xchannel, 0), \
+            'y': self._calibrateAndCorrect_Channel(self.ychannel, 1), \
+                'z': self._calibrateAndCorrect_Channel(self.zchannel, 2),})
+
+       
+
+    def load_dkdI(self, path_to_dkdI):
+        '''load the slopes of the stiffness-intensity curves for the 852nm laser.
+
+        Args: 
+            path_to_dkdI (string): path to 852_k_sens_dk_dI.csv.
+        '''
+        self.dkdI = np.genfromtxt(path_to_dkdI)
+
+    def computeForceArray(self, direction, displacement=200e-9):
+        '''computes the force xarray.DataArray from the probe position and stimulus intensity
+        
+        Args:
+            direction: 0, 1, or 2 for the x, y, or z direction of pulling.
+            displacement (float): distance between the center of the 852nm trap and the mephisto trap.
+        
+        '''
+        self.springconst = np.multiply(self.powerArray, self.dkdI[direction])
+
+
+        if(direction != 1):
+            print("pulling direction x or z has not yet been implemented")
+            pass
+        
+        #compute the focus shift based on the powerArray
+        focusshiftArray = self.focus_shift['ymean'].interp(voltage = self.powerArray, kwargs={'fill_value': 'extrapolate'})
+    
+        self.forceArray = self.springconst * (displacement-self.data_calibrated['y']+focusshiftArray)
+
+        return (self.springconst,self.forceArray)
+
+
+    def _calibrateAndCorrect_Channel(self, channel, direction):
+        '''apply calibration and corrections to one channel of the signals.
+
+        Args:
+            channel (nptdms.channel): channel object containing the time series.
+            direction (int): 0, 1, or 2 for the x, y, or z direction.
+
+        Returns: wave (xarray.DataArray):  calibrated and corrected data for the chosen channel.
+        '''
+
+        strdir = ['x', 'y', 'z']
+        
+        #correct for influence of the pedestal
+        if(np.isfinite(self.pedestalcorr[direction]) is False):
+            raise ValueError('pedestal corr is not finite')
+        
+        data = np.array(channel.data)
+        data = np.subtract(data, self.pedestalcorr[direction])
+        
+        d = direction
+        coef = np.array(self.nonlin_correction[strdir[direction]])
+        #calibrate and correct for nonlinear detector
+        if(np.isfinite(coef) is False):
+            raise ValueError('nonlin coef is not finite')
+        datacal = np.polynomial.polynomial.polyval(data, coef, tensor=False)
+        datacal = np.multiply(datacal, 1e-9) #result is in nm; convert to meters to stay in SI units.
+
+        #apply the offsets
+        if(np.isfinite(self.offsets[direction]) is False):
+            raise ValueError('offsets are not finite')
+        datacal = np.subtract(datacal, self.offsets[direction])
+
+        #apply Flyvbjerg correction
+        if(np.isfinite(self.Flyvbjerg_Corr['Flyvbjerg Corr'][direction]) is False):
+            raise ValueError('Flyvbjerg corr is not finite')
+        datacal = np.divide(datacal, self.Flyvbjerg_Corr['Flyvbjerg Corr'][direction])
+        
+        #apply coverslip correction to x and y channel. We do not know if (or how much) the z detector is rescaled, but we also do not pull along z, so who cares.
+        if(np.isfinite(self.coverslip_corr) is False):
+            raise ValueError('coverslip corr is not finite')
+        if(direction < 3):
+            datacal = np.divide(datacal, self.coverslip_corr)
+
+        #we are done, build a nice xarray to return to the user
+        time = channel.time_track()
+        wave = xr.DataArray(datacal,
+                    dims='time',
+                    coords = {'time': time},
+                    name=strdir[direction] + 'position')
+
+        return wave
+
+class Histogram3D(object):
+    '''3D histogram from an x, y, z time series'''
+
+    def __init__(self, timeseries, numbins, binsize):
+        '''Construct a 3D histogram from an x, y, z time series
+         
+        Args:
+           timeseries (np.array): (3 x m)-dimensional array (time series of length m, 3 dimensions)
+           numbins (int): number of bin edges along each axis. 
+           binsize (float): bin size in meters
+        '''
+        start = (-1) * numbins/2 * binsize
+        end = numbins/2 * binsize
+        bins_oneaxis = np.arange(start, end, binsize)
+        bins = [bins_oneaxis, bins_oneaxis, bins_oneaxis]
+        self.histo3D = np.histogramdd(sample=(timeseries[0], timeseries[1], timeseries[2]), bins=bins)
+        self.GlobalEnergyMinimum = np.array([0.0, 0.0, 0.0, 0.0]) #location and value -> N = 4
+
+    def plotlyIsosurface(self, isomin, isomax, title):
+        '''Return a plotly FigureWidget containing an isosurface representation of the 3D histogram
+        
+        Args: 
+            isomin (int): minimum value of isosurface colorscale
+            isomax (int): max value of isosurface colorscale
+            title (string): title of the plot
+        '''
+
+        # generate X, Y, Z, Values arrays. Plotly needs these as inputs to the Isosurface function. We are storing these as properties
+        # so that the user could access them to plot more involved isosurface representations from the Jupyter notebook.
+        self.histo3D_unrolled = np.reshape(self.histo3D[0], [-1])
+        self.histo3D_unrolled_coords = [ [x,y,z] for z in self.histo3D[1][2][:-1] for y in self.histo3D[1][1][:-1] for x in self.histo3D[1][0][:-1]]
+
+        data = [go.Isosurface(
+            x=np.array(self.histo3D_unrolled_coords)[:,0],
+            y=np.array(self.histo3D_unrolled_coords)[:,1],
+            z=np.array(self.histo3D_unrolled_coords)[:,2],
+            value=self.histo3D_unrolled,
+            isomin=isomin,
+            isomax=isomax,
+            colorscale = 'Blues'
+        )]
+        layout = go.Layout(title=title)
+        return go.FigureWidget(data, layout)
+
+    def surfaceOfMaxOccupancy(self, perpendicular_axis):
+        '''Return an xarray.DataArray of the surface of maximum occupancy. Starts searching for this surface perpendicular to 'perpendicular_axis'
+
+        Args: 
+            perpendicular_axis (int): 0, 1, or 2 for x, y, or z.
+        '''        
+
+        #we will fit a Gaussian to each column of voxels along the perpendicular_axis, with the guesses from surfaceposguess and surfacewidthguess
+        fitfunc  = lambda p, x: p[0]*np.exp(-0.5*((x-p[1])/p[2])**2)
+        errfunc  = lambda p, x, y: (y - fitfunc(p, x))
+
+        histdata = self.histo3D[0]
+        histedge = self.histo3D[1][perpendicular_axis]
+        hist_bin_centers = histedge[0:-1] + (histedge[1]-histedge[0])/2
+
+        #iterate over xy positions. we will call the direction of perpendicular_axis the z axis.
+        #rearrange the 3D matrix to orient it appropriately:
+        order = np.array([0, 1, 2]) - perpendicular_axis
+        histdata_rearr = histdata.transpose(*order)
+        surfaceposguess = histdata_rearr.argmax(axis=2)
+        surfaceposguess = hist_bin_centers[surfaceposguess]
+        surfacemaxguess = np.max(histdata_rearr, axis=2)
+        surfacewidthguess = np.std(histdata_rearr, axis=2)
+        counts = np.sum(histdata_rearr, axis=2)
+        
+        surfacepos = np.copy(surfaceposguess.astype(float))
+        
+        for index, pos in np.ndenumerate(surfaceposguess):
+            if(counts[index] > 100):
+                vals = histdata_rearr[index]
+                init = [surfacemaxguess[index], pos, surfacewidthguess[index]]
+                out = leastsq(errfunc, init, args=(hist_bin_centers, vals))
+                surfacepos[index] = out[0][1]
+                
+                #update the global energy minimum value and location
+                if(surfacemaxguess[index] > self.GlobalEnergyMinimum[3]):
+                    self.GlobalEnergyMinimum[0] = hist_bin_centers[index[0]]
+                    self.GlobalEnergyMinimum[1] = hist_bin_centers[index[1]]
+                    self.GlobalEnergyMinimum[2] = out[0][1]
+                    self.GlobalEnergyMinimum[3] = surfacemaxguess[index]
+            else:
+                surfacepos[index] = 0
+
+        self.maxOccupancySurface = xr.DataArray(surfacepos,
+                                                dims = ['x', 'y'],
+                                                coords = {'x': hist_bin_centers, 'y': hist_bin_centers},
+                                                name='surface of maximum occupancy')
+
+        return self.maxOccupancySurface
+    
+    def EnergyLandscapeAlongTether(self, dx, numpnts, axis=1):
+        '''Return the energy landscape along the tether direction. Determines the orientation of the tether from the orientation of the bead fluctuations.
+        
+        Args: 
+            dx (float): stepsize in meters (choose this similar to the binsize of the histogram).
+            numpnts (int): number of steps along the tether direction. The global energt minimum will be at the center of the steps.
+            axis (int): the axis with which the tether is approximately aligned.
+        '''
+
+        _ = self.surfaceOfMaxOccupancy(axis)
+        surfnorm = self.SurfaceNormalAtGlobMinimum
+        
+        startpos = np.array([self.GlobalEnergyMinimum[0:3]] - surfnorm * dx * numpnts/2 )
+        path = self.SurfaceNormalAtGlobMinimum[:, np.newaxis] * dx * np.array( [np.arange(numpnts), np.arange(numpnts), np.arange(numpnts)]) + startpos.T
+        intpArray = self.histo3Darray_transposed(axis).interp(x=path[0,:], y=path[1,:], z=path[2,:])
+        occupancy = [intpArray.values[i, i, i] for i in range(numpnts)]
+        #print(occupancy)
+        energy = (-1)* np.log(occupancy)
+
+        energyArray = xr.DataArray(energy,
+                                    dims = 'tether direction',
+                                    coords = {'tether direction': np.arange(numpnts) * dx},
+                                    attrs = {'coord3D': path},
+                                    name='energy')
+        occupancyArray = xr.DataArray(occupancy,
+                                    dims = 'tether direction',
+                                    coords = {'tether direction': np.arange(numpnts) * dx},
+                                    attrs = {'coord3D': path},
+                                    name='occupancy')
+        return xr.Dataset({'occupancy': occupancyArray, 'energy': energyArray})
+
+    def ProteinAnchorPosition(self, energylandscape=None):
+        '''Return the coordinates of the anchor position of the protein
+
+        Args:
+            energy landscape (xarray.DataArray): energy landscape of the tethered protein. Must contain the three dimensional coordinates of the values as 'coord3D' attribute.
+                                                If you do not pass an energylandscape, this function will attempt to compute it for you.
+        '''
+        if energylandscape == None:
+            energylandscape = self.EnergyLandscapeAlongTether(dx=2e-9, numpnts=300, axis=1)['energy']
+
+        cutoff = int(np.floor(len(energylandscape)/2))
+        anchorindex = np.max(np.where(energylandscape[0:cutoff]==np.inf)) #index in the energy landscape whose value is inf while being closest to the energy minimum
+        path = energylandscape.attrs['coord3D']
+        anchorpos = path[:,int(anchorindex)]
+
+        return anchorpos
+
+    @property
+    def histo3DArray(self):
+        '''Return the 3D histogram object as an xarray.'''
+        histdata = self.histo3D[0]
+        histedge = self.histo3D[1][1]
+        hist_bin_centers = histedge[0:-1] + (histedge[1]-histedge[0])/2
+        return xr.DataArray(histdata,
+                            dims = ['x', 'y', 'z'],
+                            coords = {'x': hist_bin_centers, 'y': hist_bin_centers, 'z': hist_bin_centers},
+                            name='3D histogram')
+
+    def histo3Darray_transposed(self, pullingaxis=1):
+        '''Return the 3D histogram object as an xarray. Rotate the array so that the pulling direction alignes with the z axis
+        
+        Args:
+            pullingaxis (int): direction in which the tether will be pulled. x=0, y=1, z=2.
+        '''
+        order = np.array([0, 1, 2]) - pullingaxis
+        histdata = self.histo3D[0]
+        histdata_rearr = histdata.transpose(*order)
+        histedge = self.histo3D[1][1]
+        hist_bin_centers = histedge[0:-1] + (histedge[1]-histedge[0])/2
+        return xr.DataArray(histdata_rearr,
+                            dims = ['x', 'y', 'z'],
+                            coords = {'x': hist_bin_centers, 'y': hist_bin_centers, 'z': hist_bin_centers})
+
+
+    @property
+    def SurfaceNormalAtGlobMinimum(self):
+        '''Return the surface normal of the maxOccupancySurface at the GlobalEnergyMinimum'''
+        
+        #find tangent in x direction
+        xmin = self.GlobalEnergyMinimum[0]
+        ymin = self.GlobalEnergyMinimum[1]
+
+        tangentx = np.zeros(3)
+        tangentx[0]=20e-9
+        tangentx[1]=0
+        tangentx[2]=self.maxOccupancySurface.interp(x=xmin+10e-9, y=ymin)-self.maxOccupancySurface.interp(x=xmin-10e-9, y=ymin)
+        
+        tangenty = np.zeros(3)
+        tangenty[0]=0
+        tangenty[1]=20e-9
+        tangenty[2]=self.maxOccupancySurface.interp(x=xmin, y=ymin+10e-9)-self.maxOccupancySurface.interp(x=xmin, y=ymin-10e-9)
+
+        surfnormal = np.zeros(3)
+        surfnormal[0]=tangentx[1]*tangenty[2]-tangentx[2]*tangenty[1]
+        surfnormal[1]=-tangentx[0]*tangenty[2]+tangentx[2]*tangenty[0]
+        surfnormal[2]=tangentx[0]*tangenty[1]-tangentx[1]*tangenty[0]
+        
+        surfnormalnorm=np.sqrt(surfnormal[0]**2+surfnormal[1]**2+surfnormal[2]**2)
+        surfnormal[0]/=surfnormalnorm
+        surfnormal[1]/=surfnormalnorm
+        surfnormal[2]/=surfnormalnorm
+
+        return surfnormal
+
+class Histogram2D(object):
+    '''represents a 2D histogram constructed from two time series'''
+
+    def __init__(self, wave1, wave2, delta1, delta2, min1=None, max1=None, min2=None, max2=None):
+        '''Construct a new 2D histogram.
+        
+        Args:
+            wave1 (xarray.Dataarray): first time series.
+            wave2 (xarray.Dataarray): second time series.
+            delta1 (float): binsize of bins along the axis of timeseries 1.
+            delta2 (float): binsize of bins along the axis of timeseries 2.
+            min1 (float): minimum value of time series 1 to be included in histogram. If None: include the smallest value.
+            max1 (float): maximum value of time series 1 to be included in histogram. If None: include the largest value.
+            min2 (float): minimum value of time series 2 to be included in histogram. If None: include the smallest value.
+            max2 (float): maximum value of time series 2 to be included in histogram. If None: include the largest value.
+        '''
+        if min1 is None:
+            min1 = np.min(wave1.values)
+        if min2 is None:
+            min2 = np.min(wave2.values)  
+        if max1 is None:
+            max1 = np.max(wave1.values)
+        if max2 is None:
+            max2 = np.max(wave2.values)       
+
+        bins1 = np.arange(min1, max1, delta1)
+        bins2 = np.arange(min2, max2, delta2)
+        bins = [bins1, bins2]
+        histo2Dvals = np.histogramdd(sample=(wave1.values, wave2.values), bins=bins)
+        histdata = histo2Dvals[0]
+        histedge1 = histo2Dvals[1][0]
+        histedge2 = histo2Dvals[1][1]
+        hist_bin_centers_1 = histedge1[0:-1] + (histedge1[1]-histedge1[0])/2
+        hist_bin_centers_2 = histedge2[0:-1] + (histedge2[1]-histedge2[0])/2
+        self.histo2D = xr.DataArray(histdata,
+                            dims = [wave1.name, wave2.name],
+                            coords = { wave2.name: hist_bin_centers_2, wave1.name: hist_bin_centers_1})
+        
+
+
+class ForceExtHeatmap(Histogram2D):
+    '''represents a 2D histogram of force-extension trials.'''
+
+    def __init__(self, forcewave, extensionwave, maxforce, maxextension, dforce, dextension):
+        '''construct a new force-extension heatmap
+        
+        Args: 
+            forcewave (xarray.Dataarray): force time trace
+            extensionwave(xarray.Dataarray): extension time trace
+            maxforce (float): maximum force
+            maxextension (float): maximum extension
+            dforce (float): force bin width
+            dextension (float): extension bin width
+        '''
+        super().__init__(forcewave, extensionwave, delta1 = dforce, delta2 = dextension, min1=0, max1 = maxforce, min2 = 0, max2=maxextension)
+
+    @property
+    def heatmap(self):
+        return self.histo2D
+
+
+class ForceRampHandler(object):
+    '''Provides tools to handle single-molecule force ramp data.'''
+
+    def __init__(self, forcewave, extensionwave, numtrials, smooth = True, auto = True, savgol_coeff = [101,3]):
+        '''Create a new ForceRampHandler.
+
+        Args:
+            forcewave (xarray.Dataarray): an appropriately cut force time trace (must contain only ramps, nothing else).
+            extensionwave (xarray.Dataarray): an appropriately cut extension time trace (over the same time domain as the forcewave).
+            numtrials (int): number of ramps in the time trace
+            smooth (Boolean): smooth the data using a Savitzky Golay filter?
+            savgol_coeff (list): [savgol window size, polynomial order]
+        '''
+        #smooth?
+        if(smooth):
+            extensionwave = savgol_filter(extensionwave, savgol_coeff[0],savgol_coeff[1])
+            forcewave = savgol_filter(forcewave, savgol_coeff[0],savgol_coeff[1]) 
+         
+        if(auto == False):
+            #stack each individual phase of each cycle into its own row of a matrix
+            length = int(np.floor(len(np.array(forcewave))/(numtrials*2)))
+            fwave = forcewave[0:numtrials*2*length]
+            exwave = extensionwave[0:numtrials*2*length]
+            forcematrix = np.array(fwave).reshape((-1, length))
+            extensionmatrix = np.array(exwave).reshape((-1, length))
+            force_pulls = forcematrix[::2]
+            force_releases = forcematrix[1::2]
+            extension_pulls = extensionmatrix[::2]
+            extension_releases = extensionmatrix[1::2]
+        if(auto == True):
+            smoothed_signal = forcewave[::100]
+            new = np.convolve(smoothed_signal, np.ones((50,))/50, mode='valid')
+            diff = np.diff(new)
+            new_diff = np.convolve(diff, np.ones((50,))/50, mode='valid')
+            new_diff_2 = abs(np.diff(new_diff))
+            max_idx = find_peaks(new_diff_2,height=max(new_diff_2)/5,distance=300)[0]*100
+            max_idx = np.reshape(max_idx,(int(len(max_idx)/3),3))
+            size = int((max_idx[0][2] - max_idx[0][0] + 10000)/2)
+            force_pulls,force_releases,extension_pulls,extension_releases = [np.zeros(size)],[np.zeros(size)],[np.zeros(size)],[np.zeros(size)]
+            for val in max_idx:
+                val[1] = val[1] + 5000
+                force_pull = np.array(forcewave[val[1] - size:val[1]])
+                force_release = np.array(forcewave[val[1]:val[1] + size])
+                ex_pull = np.array(extensionwave[val[1] - size:val[1]])
+                ex_release = np.array(extensionwave[val[1]:val[1] + size])
+                force_pulls = np.append(force_pulls,[force_pull],axis=0)
+                force_releases = np.append(force_releases,[force_release],axis=0)
+                extension_pulls = np.append(extension_pulls,[ex_pull],axis=0)
+                extension_releases = np.append(extension_releases,[ex_release],axis=0)
+            force_pulls = force_pulls[1:]
+            force_releases = force_releases[1:]
+            extension_pulls = extension_pulls[1:]
+            extension_releases = extension_releases[1:]
+        
+        # Switch variables
+        self.pulls = np.stack((force_pulls, extension_pulls), axis=2)
+        self.releases = np.stack((force_releases, extension_releases), axis=2)
+
+
+    @property
+    def pullsXr(self):
+        '''Return a list of xarray.DataArray objects for all pulls'''
+        pulls = []
+        for pull in self.pulls:
+            pullArray = xr.DataArray(pull[:,1],
+                                    dims=['force'],
+                                    coords = {'force': pull[:,0]},
+                                    name='extension')
+            pulls.append(pullArray)
+        return pulls
+
+    @property
+    def releasesXr(self):
+        '''Return a list of xarray.DataArray objects for all releases'''
+        releases = []
+        for release in self.releases:
+            releaseArray = xr.DataArray(release[:,1],
+                                    dims=['force'],
+                                    coords = {'force': release[:,0]},
+                                    name='extension')
+            releases.append(releaseArray)
+        return releases
+
+    def LayoutOfCycles(self, start, stop, fits_pulls = None, fits_releases = None):
+        '''Return a holoviews layout of force-extension cycles.
+
+        Args:
+            start (int): number of first cycle in layout.
+            stop (int): number of last cycle in layout.
+            fits_pulls (list of lists of xr.DataArray): outer list: cycle, inner list: segment within cycle.
+            fits_releases (list of lists of xr.DataArray): outer list: cycle, inner list: segment within cycle.
+        Returns:
+            layout (holoviews/matplotlib): layout of cycles.
+        '''
+        hv.extension('matplotlib')
+        #all_cycles = hv.Layout()
+        all_cycles_dict = OrderedDict()
+        for cyclenum in np.arange(start, stop):
+            pull = self.pullsXr[cyclenum]
+            release = self.releasesXr[cyclenum]
+            
+            currentcycle = OrderedDict()
+            currentcycle['extension'] = hv.Curve(pull,label='Extension').opts(color='red')
+            currentcycle['relaxation'] = hv.Curve(release,label='Relaxation').opts(color='blue')
+            
+            if (fits_pulls is not None and fits_releases is not None):
+                for i, pullfit in enumerate(fits_pulls[cyclenum]):
+                    currentcycle['fit (pull) ' + str(i)] = hv.Curve(pullfit, label='Extension').opts(color='black', linestyle='dashed')
+                for i, releasefit in enumerate(fits_releases[cyclenum]):
+                    currentcycle['fit (relaxation) ' + str(i)] = hv.Curve(releasefit, label='Relaxation').opts(color='black', linestyle='dashed')
+
+            layout = hv.NdOverlay(currentcycle,label=f'Cycle {cyclenum}',kdims='ramp', sort=False).options({'Curve': {'xlim': (0, 70), 'ylim': (0, 200)}})
+            layout.opts(show_legend = True)
+            cyclelayout = layout.opts(xlabel='Force (pN)', ylabel='Extension (nm)')
+            all_cycles_dict[str(cyclenum)] = cyclelayout          
+        
+        all_cycles = hv.Layout(all_cycles_dict, kdims='cycle')
+        hd.shade.color_key=None #reset
+        
+        return all_cycles.cols(4)
+    
+    def returnCycle(self, wanted_cycle, min_force=1):
+        '''Return two dataframes, one containing all pulls data (force and extension) and the other containing all releases data
+        
+        Args:
+            start (int): number of first cycle in layout.
+            stop (int): number of last cycle in layout.
+            mine_force(int): get rid of points with forces below this value
+
+        Returns:
+            dataframes: dataframes containing all pulls and releases (columns)
+        '''
+
+        pull_cycle = self.pullsXr[wanted_cycle]
+        pull_cycle = pull_cycle[pull_cycle['force'].values>min_force]
+        release_cycle = self.releasesXr[wanted_cycle]
+        release_cycle = release_cycle[release_cycle['force'].values>min_force]
+
+        return pull_cycle, release_cycle
+
+
+    def getSegments(self, pullOrRelease, ispull, numsdevs=5, force_threshold=3, window=1000): #3e-12 in N
+        '''determine the segments within one pull or relaxation'''
+        (steps_start, steps_end) = self._detectConfChange(pullOrRelease[:,1], pullOrRelease[:,0], pull=ispull, numsdevs=numsdevs, force_threshold=force_threshold, window=window)
+        segments = self._confChangeToSegments(steps_start, steps_end, pullOrRelease[:,1], pullOrRelease[:,0])
+        return segments
+    
+    def getAllSegments(self, numsdevs=5, force_threshold=3, window=1000): #3e-12 in N
+        '''return all segments in the force ramp experiment. Returns two lists, one for the pulls and the other for relaxations.
+        Use Dask for parallel processing'''
+
+        #create RDDs
+        print(len(self.pulls))
+        print(len(self.releases))
+        pulls_rdd = sc.parallelize(self.pulls, 8)
+        print('collecting results for pulls')
+        result_pulls = pulls_rdd.mapPartitions(partial(self._getSegmentsSpark,ispull=True, numsdevs=numsdevs, force_threshold=force_threshold, window=window)).collect()
+        pulls_rdd.unpersist()
+
+        releases_rdd = sc.parallelize(self.releases, 8)
+        print('collecting results for releases')
+        result_releases = releases_rdd.mapPartitions(partial(self._getSegmentsSpark,ispull=False, numsdevs=numsdevs, force_threshold=force_threshold, window=window)).collect()
+        releases_rdd.unpersist()
+
+        segs_pulls = [item for sublist in result_pulls for item in sublist]
+        segs_releases = [item for sublist in result_releases for item in sublist]
+
+        return (segs_pulls, segs_releases)
+
+    def _getSegmentsSpark(self, chunk_of_RDD, ispull=True, numsdevs=5, force_threshold=3, window=1000):
+        '''return all segments in the spark RDD chunk.'''
+        
+        s = []
+        c = list(chunk_of_RDD)
+        for row in c:
+            r = np.array(row)
+            s.append(self.getSegments(row, ispull=ispull, numsdevs=numsdevs, force_threshold=force_threshold, window=window))
+        return s
+
+
+    def fitAllPullsWithWLCs(self, pulls, numsdevs=5, force_threshold=3): #3e-12 in N
+
+        lcs_all_pulls = []
+        Ks_all_pulls = []
+        #b_all_pulls = []
+        dLc_vs_F = []
+        fit_pulls = []
+
+        # these are guesses for each parameter
+        #lpGuess=2 #persistence length, nm. 
+        #lcGuess=1.4 #contour length, nm
+        #KGuess=7*14 #spring constant
+        #bGuess=2.9
+
+        #guesses=[lcGuess,KGuess, bGuess]
+
+        for (i, pull) in enumerate(pulls):
+            print(i)
+            (steps_start, steps_end) = self._detectConfChange(pull[:,1], pull[:,0], pull=True, numsdevs=numsdevs, force_threshold=force_threshold, window=1000)
+            segments = self._confChangeToSegments(steps_start, steps_end, pull[:,1], pull[:,0])
+            lcs_one_pull = []
+            Ks_one_pull = []
+            #b_one_pull = []
+            Fmaxs_one_pull = [] #maximum force at the end of each segment (i.e. the forces at which a rip happened)
+            segfit_one_pull =[]
+            for seg in segments:
+                (params, params_cov, seg_fit, fitfailed) = self._fitSeriesWLCs(seg)
+                #(params, params_cov, seg_fit, fitfailed) = self._fitSeriesWLCs(seg, lps=[0.5, 0.49], lcs=[37, 1.4], Ks=[7.2*37,10*14], bs=[2.9], holdconst= [True, True, True, False, True, False, False])
+                if (fitfailed): #curve fit failed
+                    continue
+                lcs_one_pull.append(params[0])
+                Ks_one_pull.append(params[1])
+                #b_one_pull.append(params[2])
+                Fmaxs_one_pull.append(np.max(seg.values))
+                segfit_one_pull.append(seg_fit)
+            if(len(lcs_one_pull) > 1):
+                #conformational change detected
+                dLcs = np.diff(lcs_one_pull)
+                for dLc, F in zip(dLcs, Fmaxs_one_pull):
+                    dLc_vs_F.append([F, dLc, i])
+            lcs_all_pulls.append(lcs_one_pull)
+            Ks_all_pulls.append(Ks_one_pull)
+            #b_all_pulls.append(b_one_pull)
+            fit_pulls.append(segfit_one_pull)
+        
+        return (lcs_all_pulls, Ks_all_pulls, dLc_vs_F, fit_pulls)
+
+    def fitAllCyclesWithWLCs_parallel(self, pulls, releases, numprocesses = 10, numsdevs=5, force_threshold=3): #3e-12 in N
+        print('fitting pulls')
+        with Pool(numprocesses) as p:
+            result_tuple_pulls = p.map(partial(self._processOneRamp, ispull=True), pulls, chunksize = 30)
+        print('fitting releases')
+        with Pool(numprocesses) as p:   
+            result_tuple_releases = p.map(partial(self._processOneRamp, ispull=False), releases, chunksize = 30)
+            
+        return (result_tuple_pulls , result_tuple_releases)
+
+    def _processOneRamp(self, pull, ispull, numsdevs=5, force_threshold=3): #3e-12 in N
+        (steps_start, steps_end) = self._detectConfChange(pull[:,1], pull[:,0], pull=ispull, numsdevs=numsdevs, force_threshold=force_threshold, window=1000)
+        segments = self._confChangeToSegments(steps_start, steps_end, pull[:,1], pull[:,0])
+        lc_one_pull = []
+        #K_one_pull = []
+        #b_one_pull = []
+        dLc_vs_F_one_pull = []
+        F_extremes_one_pull = [] #maximum (minimum) force at the end of each segment for pulls (releases)  (i.e. the forces at which a rip happened)
+        
+
+        # these are guesses for each parameter
+        #lpGuess=2 #persistence length, nm. 
+        #lcGuess=1.4 #contour length, nm
+        #KGuess=7*14 #spring constant
+        #bGuess=2.9
+
+        #guesses=[lcGuess,KGuess]#, bGuess]
+
+        segfit_one_pull =[]
+        for seg in segments:
+            (params, params_cov, seg_fit, fitfailed) = self._fitSeriesWLCs(seg)
+            #(params, params_cov, seg_fit, fitfailed) = self._fitSeriesWLCs(seg, lps=[0.5, 0.49], lcs=[37, 1.4], Ks=[7.2*37,10*14], bs=[2.9], holdconst= [True, True, True, False, True, False, False])
+            if (fitfailed): #curve fit failed
+                continue
+            lc_one_pull.append(params[0])
+            #K_one_pull.append(params[1])
+            #b_one_pull.append(params[2])
+            if(ispull):
+                F_extremes_one_pull.append(np.max(seg.values))
+            else:
+                F_extremes_one_pull.append(np.min(seg.values))
+            segfit_one_pull.append(seg_fit)
+        if(len(lc_one_pull) > 1):
+            #conformational change detected
+            dLcs = np.diff(lc_one_pull)
+            for dLc, F in zip(dLcs, F_extremes_one_pull):
+                dLc_vs_F_one_pull.append([F, dLc])
+        
+        return (lc_one_pull, dLc_vs_F_one_pull, segfit_one_pull)#, segments
+        
+
+
+    def _detectConfChange(self, forcewave, extensionwave, pull=True, numsdevs=5, force_threshold=3, window=1000): #3e-12 in N
+        '''Runs a statistical test to determine conformational changes in the extension wave. Only considers data for which the force is larger than force_threshold.
+
+            Args:
+                forcewave (np.array): force time trace.
+                extensionwave (np.array): extension time trace.
+                pull (boolean): Is the provided data a pull or a relaxation?
+                numsdevs (int): identify events if they are this many number of sdevs above noise.
+                force_threshold (float): threshold for the force: do not test data with a force smaller than this value.
+                window (int): number of data points to consider for the statistical test.
+        '''
+        if(pull is False): #create waves with monotonically increasing force
+            forcewave = np.flip(forcewave)
+            extensionwave = np.flip(extensionwave)
+        
+        mask = forcewave > force_threshold
+        detected_steps = np.copy(forcewave) 
+        detected_steps.fill(0)
+        
+        #where does the ramp start?
+        startindex = np.argmax(mask)
+
+        for index in np.arange(startindex + window, len(extensionwave) - window, 1):
+            mean_before = np.mean(extensionwave[index-window:index])
+            mean_after =  np.mean(extensionwave[index:index+window])
+            sdev_before = np.std(extensionwave[index-window:index])
+            sdev_after = np.std(extensionwave[index:index+window])
+            detected_steps[index] = np.abs(mean_after-mean_before) > numsdevs*(sdev_before+sdev_after)/2
+        
+        #undo the flip:
+        if(pull is False):
+            detected_steps = np.flip(detected_steps)
+
+        #find beginning and end of each transition
+        d_steps = np.diff(detected_steps)
+        steps_start = np.where(d_steps==1)
+        steps_end = np.where(d_steps==-1)
+        return (steps_start, steps_end)
+
+    def _detectConfChangeCMV(self, pullOrRelease, pull=True, numsdevs=5, force_threshold=3, window=1000): #3e-12 in N
+        '''Runs a statistical test to determine conformational changes in the extension wave. Only considers data for which the force is larger than force_threshold.
+
+            Args:
+                forcewave (np.array): force time trace.
+                extensionwave (np.array): extension time trace.
+                pull (boolean): Is the provided data a pull or a relaxation?
+                numsdevs (int): identify events if they are this many number of sdevs above noise.
+                force_threshold (float): threshold for the force: do not test data with a force smaller than this value.
+                window (int): number of data points to consider for the statistical test.
+        '''
+        forcewave = pullOrRelease[1].values
+        extensionwave = pullOrRelease[1]['extension']
+
+        if(pull is False): #create waves with monotonically increasing force
+            forcewave = np.flip(forcewave)
+            extensionwave = np.flip(extensionwave)
+        
+        mask = forcewave > force_threshold
+        detected_steps = np.copy(forcewave)
+        detected_steps.fill(0)
+        
+        #where does the ramp start?
+        startindex = np.argmax(mask)
+
+        for index in np.arange(startindex + window, len(extensionwave) - window, 1):
+            mean_before = np.mean(extensionwave[index-window:index])
+            mean_after =  np.mean(extensionwave[index:index+window])
+            sdev_before = np.std(extensionwave[index-window:index])
+            sdev_after = np.std(extensionwave[index:index+window])
+            detected_steps[index] = np.abs(mean_after-mean_before) > numsdevs*(sdev_before+sdev_after)/2
+        
+        #undo the flip:
+        if(pull is False):
+            detected_steps = np.flip(detected_steps)
+
+        #find beginning and end of each transition
+        d_steps = np.diff(detected_steps)
+        steps_start = np.where(d_steps==1)
+        steps_end = np.where(d_steps==-1)
+        return (steps_start, steps_end)
+
+    def _confChangeToSegments(self, steps_start, steps_end, forcewave, extensionwave,pull=True):
+        '''Return a segmentated representation fo forcewave and extension wave, deliminated by the conformational changes
+
+            Args:
+                steps_start (np.array): detected start indices of conformational changes, output from _detectConfChange
+                steps_end (np.array): detected end indices of conformational changes, output from _detectConfChange
+                forcewave (np.array): force time trace
+                extensionwave (np.array): extension time trace 
+            
+            Returns:
+                segments (list): list of xr.DataArray containing the force extension segments.
+        '''
+        _steps_start = np.insert(steps_start, 0, 0) #insert a zero at the beginning of _steps_start
+        _steps_end = np.insert(steps_end, 0, 0)
+        
+        _steps_start = np.append(_steps_start, len(forcewave))
+        _steps_end = np.append(_steps_end, len(forcewave))
+
+        ruptureForce = []
+        segments = []
+        for start, end in zip(_steps_start[1:], _steps_end[0:-1]):
+            force_segment = forcewave[end:start]
+            extension_segment = extensionwave[end:start]
+            seg = xr.DataArray(extension_segment,#force_segment,
+                                dims=['force'],#dims=['extension'],
+                                coords={'force': force_segment},#coords={'extension': extension_segment},
+                                name='extension')#name='force')
+            if pull==True:
+                ruptureForce.append(np.max(seg['force'].values))#ruptureForce.append(np.max(seg.values))
+            else:
+                ruptureForce.append(np.min(seg['force'].values))#ruptureForce.append(np.min(seg.values))
+            segments.append(seg)
+
+        return segments,ruptureForce
+
+    def returnSegmentsOneCycle(self,force_cycle,extension_cycle, pull=True, numsdevs=5, force_threshold=3, window=1000):
+        '''
+        Return segments (demarcated by conformational change) of a pull/release curve of interest.
+        
+        Args: 
+            force_cycle (pandas dataframe): force wave of the pull or release.
+            extension_cycle (pandas dataframe): extension wave of the pull or release
+            pull (boolean): Is the provided data a pull or a relaxation?
+            numsdevs (int): identify events if they are this many number of sdevs above noise.
+            force_threshold (float): threshold for the force: do not test data with a force smaller than this value.
+            window (int): number of data points to consider for the statistical test.
+        
+        Returns:
+            segments (list): list of xr.DataArray containing the force extension segments.
+        '''
+
+        (steps_start,steps_end) = self._detectConfChange(force_cycle, extension_cycle, pull, numsdevs=numsdevs, force_threshold=force_threshold, window=window)
+        (segments, ruptureForce) = self._confChangeToSegments(steps_start, steps_end, force_cycle, extension_cycle,pull)
+
+        return segments, ruptureForce
+    
+    def _fitSeriesWLCs(self,forceExtension):
+    #def _fitSeriesWLCs(self, forceExtension, lps, lcs, Ks, bs, holdconst):
+        '''Fit force-extension data with a series of WLCs.
+
+        Args:
+            forceExtension (xr.xarray): force extension as an xarray (values: 'force', coords: 'extension')
+            lps (list of float): persistence lengths
+            lcs (list of float): contour lengths
+            Ks (list of float): enthalpic moduli
+            bs (list of float): rigid segments of length b
+            holdconst (list of boolean): which of the parameters to hold constant (in a sequence of [*lps, *lcs, *Ks])
+        '''
+        force = forceExtension.values
+        extension = np.array(forceExtension.coords['extension'])
+        
+        # these are guesses for each parameter
+        #lpGuess=2 #persistence length, nm. 
+        #lcGuess=1.4 #contour length, nm
+        #KGuess=7*14 #spring constant
+        #bGuess=2.9
+        lcGuess=10*1.4 #contour length of linkers, nm
+
+        guesses=[lcGuess]#, bGuess]
+
+
+        #init = [*lps, *lcs, *Ks, *bs]
+        
+        #decimate the waves to get 1 ms time resolution
+        if(len(force) > 5000):
+            force_decimated = force[::100]
+            extension_decimated = extension[::100]
+        else: #not enough points to fit
+            warnings.warn("Curve fit failed: not enough points")
+            fitfailed = True
+            return -1, -1, -1, fitfailed
+        '''
+        bounds_upper = []
+        bounds_lower = []
+        #create array of bounds to account for parameters we wish to hold constant:
+        for const, param in zip(holdconst, init):
+            if const:
+                bounds_upper.append(1.001 * param)
+                bounds_lower.append(0.999 * param)
+            else:
+                #bounds_upper.append(50)
+                bounds_upper.append(np.inf) #original
+                #bounds_lower.append(0)
+                bounds_lower.append(-np.inf) #original
+
+        bounds = (bounds_lower, bounds_upper) # having error message of "ValueError: Each lower bound must be strictly less than each upper bound."
+        '''     
+
+        try:
+            params, params_cov = curve_fit(self.MonomerFit, force_decimated, extension_decimated, p0= guesses)#, bounds=[0,[np.inf,np.inf]])
+            #bounds=(0,[np.inf,np.inf,np.inf])
+            #params, params_cov = curve_fit(self._fit2WLCs, force_decimated, extension_decimated, p0=init, bounds = bounds)
+        except RuntimeError:
+            fitfailed = True
+            return -1, -1, -1, fitfailed
+
+        #generate a fit object and return it
+        fitforce = np.arange(1, 70, 1)
+        fitextension = self.MonomerFit(fitforce, *params)
+        #fitextension = self._fit2WLCs(fitforce, *params)
+        fitArray = xr.DataArray(fitforce,
+                                dims=['extension'],
+                                coords={'extension': fitextension},
+                                name='force')
+
+        return params, params_cov, fitArray, False
+
+    def x_WLCes_FJC(F, lps, lcs, Ks, bs, N): 
+        '''Extension-force relation for a series of WLCes, itself in series with a FJC
+
+        Args:
+        F (float): force
+        lps (list of floats): persistence lengths
+        lcs (list of floats): contour lengths
+        Ks (list of floats): enthalpic elastic moduli
+        b (float): length of rigid segments in FJC
+        N (int): number of stiff segments in FJC
+        '''	
+        x = 0
+        x += xSeriesWLCe(F, lps, lcs, Ks)
+        x += xFJC(F, bs, N)
+	
+        return x
+
+    def x_WLCes_FJC_2(F, lps, lcs, Ks, bs, N): 
+        '''Extension-force relation for a series of WLCes, itself in series with a FJC
+
+        Args:
+        F (float): force
+        lps (list of floats): persistence lengths
+        lcs (list of floats): contour lengths
+        Ks (list of floats): enthalpic elastic moduli
+        b (float): length of rigid segments in FJC
+        N (int): number of stiff segments in FJC
+        '''	
+        x = 0
+        x += MonomerFit(F, lps, lcs, Ks, bs, N)
+        x += WLCUnfolded(F,lc)
+	
+        return x
+
+    def _fit2WLCs(self, F, lp_anchor, lp_protein, lc_anchor, lc_protein, K_anchor, K_protein, b_protein):
+
+        return x_WLCes_FJC(F, [lp_anchor, lp_protein], [lc_anchor, lc_protein], [K_anchor, K_protein], b_protein, N = 11)
+    
+    def MonomerFit(self,F,lcLinkers):
+        # This function is for the fit of the protein. There are three parts: WLC for folded protein, WLC for anchors, and FJC for the cadherins
+        kBT = 4.114 # thermal energy in nm pN and at room temp
+        NMonomer = 11
+        bMonomer = 3.71 # nm
+        kFoldedMonomer = 9 #mN/m
+        lpAnchorsMonomer=0.5 # nm
+        lcAnchorsMonomer=37 #nm
+        kAnchorsMonomer = 7.2*37 #7.2*37 # WHY MULTIPLY THIS BY 37?
+        lpLinkersMonomer = 0.49 #nm. This is actually lp peptide
+        lcLinkersMonomer = 1.4*10 #nm
+    
+        MonomerFJC = NMonomer*bMonomer * (1/np.tanh(F*bMonomer/kBT)-kBT/(F*bMonomer))+(F/kFoldedMonomer)
+        MonomerAnchors = lcAnchorsMonomer * (4/3 - 4/(3 * np.sqrt(F*lpAnchorsMonomer/kBT + 1)) - 10 * np.exp((900*kBT/(F*lpAnchorsMonomer))**(1/4)) / (np.sqrt(F*lpAnchorsMonomer/kBT) * ( np.exp((900*kBT/(F*lpAnchorsMonomer))**(1/4)) - 1)**2 ) + (F*lpAnchorsMonomer/kBT)**1.62 / (3.55 + 3.8 * (F*lpAnchorsMonomer/kBT)**2.2)) +F/kAnchorsMonomer
+        MonomerLinkers = lcLinkersMonomer * (4/3 - 4/(3 * np.sqrt(F*lpLinkersMonomer/kBT + 1)) - (10 * np.exp((900*kBT/(F*lpLinkersMonomer))**(1/4))) / (np.sqrt(F*lpLinkersMonomer/kBT) * ( np.exp((900*kBT/(F*lpLinkersMonomer))**(1/4)) - 1)**2 ) + (F*lpLinkersMonomer/kBT)**1.62 / (3.55 + 3.8 * (F*lpLinkersMonomer/kBT)**2.2)) 
+
+        # Unfolded 
+        #WLCUnfolded = lcUnfolded * (4/3 - 4/(3 * np.sqrt(F*lpPeptide/kBT + 1)) - (10 * np.exp((900*kBT/(F*lpPeptide))**(1/4))) / (np.sqrt(F*lpPeptide/kBT) * ( np.exp((900*kBT/(F*lpPeptide))**(1/4)) - 1)**2 ) + (F*lpPeptide/kBT)**1.62 / (3.55 + 3.8 * (F*lpPeptide/kBT)**2.2)) #+ F/K1
+
+    
+        return MonomerFJC + MonomerAnchors + MonomerLinkers
+    
+    def WLCUnfolded(self,F,lcUnfolded):
+        kBT = 4.114 # thermal energy in nm pN and at room temp
+        lpLinkersMonomer = 0.49 #nm. This is actually lp peptide
+
+        MonomerUnfolded = lcUnfolded * (4/3 - 4/(3 * np.sqrt(F*lpLinkersMonomer/kBT + 1)) - (10 * np.exp((900*kBT/(F*lpLinkersMonomer))**(1/4))) / (np.sqrt(F*lpLinkersMonomer/kBT) * ( np.exp((900*kBT/(F*lpLinkersMonomer))**(1/4)) - 1)**2 ) + (F*lpLinkersMonomer/kBT)**1.62 / (3.55 + 3.8 * (F*lpLinkersMonomer/kBT)**2.2)) 
+
+        return MonomerUnfolded
+
+
+
+
+
+
+    
